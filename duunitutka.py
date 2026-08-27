@@ -37,9 +37,19 @@ DB_PATH = os.getenv("DB_PATH", "/data/duunitutka.db")
 DEFAULT_LOCATIONS = ["Helsinki", "Espoo", "Kauniainen", "Vantaa", "Kirkkonummi"]
 DEFAULT_PHRASES = ["osa-aikainen asiakaspalvelu", "part-time customer service"]
 
+DEFAULT_ROLE_KEYWORDS = ["asiakaspalvelu", "asiakaspalvelija", "customer service"]
+
 LOCATIONS = env_list("LOCATIONS", DEFAULT_LOCATIONS)
 PHRASES = env_list("PHRASES", DEFAULT_PHRASES)
+ROLE_KEYWORDS = env_list("ROLE_KEYWORDS", DEFAULT_ROLE_KEYWORDS)
 LOCATION_FALLBACK = "Greater Helsinki" if LOCATIONS == DEFAULT_LOCATIONS else "Unknown"
+
+# Kill switch: checked before anything else in main(), so flipping this one
+# Railway variable silences the script even if another one is broken.
+ENABLED = os.getenv("ENABLED", "true").strip().lower() in ("1", "true", "yes")
+
+# Tavily recency bound: "day" | "week" | "month" | "year". Empty disables it.
+TIME_RANGE = os.getenv("TIME_RANGE", "month").strip()
 
 # Hardcoded on purpose: adding a job site means a new domain with its own
 # indexing quirks, which is a code change rather than a config tweak.
@@ -104,6 +114,22 @@ def guess_location(text):
     return LOCATION_FALLBACK
 
 
+def matches_target_location(title, snippet):
+    """True if a target city is named anywhere in the title or snippet."""
+    haystack = normalize(f"{title} {snippet}")
+    return any(city.lower() in haystack for city in LOCATIONS)
+
+
+def matches_target_role(title):
+    """True if the title names a target role.
+
+    Title only, deliberately: nearly every Finnish retail ad lists "hyvat
+    asiakaspalvelutaidot" among its requirements, so matching on the snippet
+    would let Myyja postings straight back through.
+    """
+    return any(keyword.lower() in normalize(title) for keyword in ROLE_KEYWORDS)
+
+
 def build_query(phrase, site):
     return f'{phrase} ({" OR ".join(LOCATIONS)}) site:{site}'
 
@@ -112,15 +138,19 @@ def build_query(phrase, site):
 
 def tavily_search(query):
     """Return Tavily results for `query`, or [] if the call failed."""
+    payload = {
+        "query": query,
+        "max_results": MAX_RESULTS_PER_QUERY,
+        "search_depth": "basic",
+    }
+    if TIME_RANGE:
+        payload["time_range"] = TIME_RANGE
+
     try:
         response = requests.post(
             TAVILY_URL,
             headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
-            json={
-                "query": query,
-                "max_results": MAX_RESULTS_PER_QUERY,
-                "search_depth": "basic",
-            },
+            json=payload,
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -221,6 +251,12 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    # Ahead of the key validation on purpose: this must silence the run even
+    # when another variable is broken or a key was just revoked.
+    if not ENABLED:
+        log.info("ENABLED=false — exiting without contacting Tavily or Telegram.")
+        return 0
+
     missing = missing_env()
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
@@ -229,10 +265,13 @@ def main():
     queries = [(phrase, name, site) for phrase in PHRASES for name, site in SOURCES]
     log.info("Locations: %s", ", ".join(LOCATIONS))
     log.info("Phrases: %s", ", ".join(PHRASES))
+    log.info("Role keywords: %s", ", ".join(ROLE_KEYWORDS))
+    log.info("Time range: %s", TIME_RANGE or "(unbounded)")
     log.info("Running %d Tavily queries, db=%s", len(queries), DB_PATH)
 
     conn = init_db(DB_PATH)
     seen_results = new_listings = notified_count = empty_queries = 0
+    skipped_location = skipped_role = 0
     try:
         for phrase, source, site in queries:
             query = build_query(phrase, site)
@@ -249,6 +288,20 @@ def main():
                     continue
 
                 snippet = (result.get("content") or "").strip()
+
+                # Relevance gates run before the dedupe lookup: a rejected
+                # result is never stored, so there is nothing for it to match.
+                # Nothing is recorded for skips either — they cost only a
+                # string check, so they are simply re-evaluated next run.
+                if not matches_target_location(title, snippet):
+                    skipped_location += 1
+                    log.info("Skip (location): %s", title)
+                    continue
+                if not matches_target_role(title):
+                    skipped_role += 1
+                    log.info("Skip (role): %s", title)
+                    continue
+
                 company = guess_company(title)
                 chash = content_hash(title, company)
                 if is_seen(conn, url, chash):
@@ -277,10 +330,13 @@ def main():
         conn.close()
 
     log.info(
-        "Done: %d queries (%d empty/failed), %d results, %d new, %d notified",
+        "Done: %d queries (%d empty/failed), %d results, %d skipped (location), "
+        "%d skipped (role), %d new, %d notified",
         len(queries),
         empty_queries,
         seen_results,
+        skipped_location,
+        skipped_role,
         new_listings,
         notified_count,
     )
