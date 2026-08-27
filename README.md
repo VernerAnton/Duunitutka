@@ -36,6 +36,17 @@ To avoid that, the database must live on a persistent volume:
 
 If you see the same postings arriving again after a run or two, this is why.
 
+## How to pause it
+
+Set **`ENABLED=false`** in Railway → Variables. The next run logs one line and
+exits before contacting Tavily or Telegram.
+
+That check is the very first thing `main()` does — ahead of the API-key
+validation — so it works even if another variable is broken or a key was just
+revoked. **This is the way to make it stop.** Don't delete the Tavily key,
+and don't clear the cron schedule; neither is needed, and both are more work to
+undo. Set `ENABLED=true` (or remove the variable) to resume.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
@@ -44,8 +55,11 @@ If you see the same postings arriving again after a run or two, this is why.
 | `TELEGRAM_BOT_TOKEN` | yes | — | from [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | yes | — | user or group chat id |
 | `DB_PATH` | no | `/data/duunitutka.db` | must be on a Railway Volume in production |
-| `LOCATIONS` | no | `Helsinki,Espoo,Kauniainen,Vantaa,Kirkkonummi` | comma-separated |
+| `ENABLED` | no | `true` | `false` exits immediately — see [How to pause it](#how-to-pause-it) |
+| `TIME_RANGE` | no | `month` | how far back Tavily may look: `day`/`week`/`month`/`year`, empty for no bound |
+| `LOCATIONS` | no | `Helsinki,Espoo,Kauniainen,Vantaa,Kirkkonummi` | comma-separated; also the location filter |
 | `PHRASES` | no | `osa-aikainen asiakaspalvelu,part-time customer service` | comma-separated |
+| `ROLE_KEYWORDS` | no | `asiakaspalvelu,asiakaspalvelija,customer service` | comma-separated; matched against the job title |
 
 Missing any of the three required variables aborts the run before any network
 call. `LOCATIONS` and `PHRASES` fall back to their defaults when unset, empty,
@@ -78,6 +92,36 @@ osa-aikainen asiakaspalvelu (Helsinki OR Espoo OR Kauniainen OR Vantaa OR Kirkko
 
 A failed Tavily query is logged and skipped — the run continues with the next
 one. Same for a failed Telegram send.
+
+`TIME_RANGE` (default `month`) bounds how far back Tavily may look. Without it
+Tavily happily returns a page indexed a year ago that still ranks for the query
+terms, which is exactly how year-old postings got notified.
+
+## Filtering
+
+Putting a city or a role in the search phrase makes Tavily *prefer* matching
+results; it does not *require* them. So every result is checked again locally
+before it can be notified:
+
+- **Location** — a target city from `LOCATIONS` must appear in the title or the
+  snippet.
+- **Role** — a keyword from `ROLE_KEYWORDS` must appear in **the title**, not
+  the snippet. Nearly every Finnish retail ad lists *"hyvät
+  asiakaspalvelutaidot"* among its requirements, so matching the snippet would
+  wave "Myyjä" postings straight through. The title is where the real role name
+  lives.
+
+A result failing either check is skipped outright — not notified, and **not
+stored**. Skipping is a string check on data already fetched, so a result costs
+nothing to re-evaluate; if a genuine target-city job was worded unclearly this
+run, it gets a fresh look next run instead of being permanently ignored. Both
+skip counts appear in the run summary, so a spam episode is diagnosable from the
+logs alone.
+
+**Known edge case, by design:** a combined title like *"Myyjä-asiakaspalvelija"*
+— a common Finnish retail job title — still passes, because `asiakaspalvelija`
+is a substring of it. That is intended: the title genuinely does name a customer
+service role. Worth watching rather than fixing.
 
 ## Deduplication
 
